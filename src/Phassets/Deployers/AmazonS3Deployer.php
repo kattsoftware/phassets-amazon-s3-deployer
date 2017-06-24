@@ -12,6 +12,7 @@ use Aws\S3\S3Client;
 class AmazonS3Deployer implements Deployer
 {
     const AWS_S3_URL_SCHEMA = 'http://%s.s3.amazonaws.com/%s';
+    const ACL_PUBLIC_READ = 'public-read';
 
     const CACHE_TTL = 3600;
 
@@ -51,6 +52,16 @@ class AmazonS3Deployer implements Deployer
     private $s3Client;
 
     /**
+     * @var bool Whether to set the ContentType to mime_content_type() returned value, when uploading to AWS
+     */
+    private $autodetectMime;
+
+    /**
+     * @var string What should trigger re-deployment of an asset ('filemtime' (default), 'md5', 'sha1')
+     */
+    private $trigger;
+
+    /**
      * Deployer constructor.
      *
      * @param Configurator $configurator Chosen and loaded Phassets configurator.
@@ -73,7 +84,7 @@ class AmazonS3Deployer implements Deployer
      */
     public function getDeployedFile(Asset $asset)
     {
-        $computedOutput = self::computeOutputBasename($asset);
+        $computedOutput = $this->computeOutputBasename($asset);
 
         $cachedUrl = $this->cacheAdapter->get(self::generateCacheKey($computedOutput));
 
@@ -98,26 +109,43 @@ class AmazonS3Deployer implements Deployer
      */
     public function deploy(Asset $asset)
     {
-        $computedOutput = self::computeOutputBasename($asset);
+        $computedOutput = $this->computeOutputBasename($asset);
 
         try {
-            /** @var \Aws\Result $result */
-            $result = $this->s3Client->putObject([
+            $putObjectParams = [
                 'Bucket' => $this->bucket,
                 'Key'    => $computedOutput,
-                'ACL'    => 'public-read',
+                'ACL'    => self::ACL_PUBLIC_READ,
                 'Body'   => $asset->getContents(),
-            ]);
+            ];
+
+            if ($this->autodetectMime) {
+                $mime = null;
+
+                if (function_exists('\\GuzzleHttp\\Psr7\\mimetype_from_extension')) {
+                    $mime = \GuzzleHttp\Psr7\mimetype_from_extension($asset->getExtension());
+                }
+
+                if($mime === null && function_exists('mime_content_type')) {
+                    $mime = mime_content_type($asset->getFullPath());
+                }
+
+                if ($mime !== null) {
+                    $putObjectParams['ContentType'] = $mime;
+                }
+            }
+
+            /** @var \Aws\Result $result */
+            $result = $this->s3Client->putObject($putObjectParams);
 
             $objectUrl = $result->get('ObjectURL');
 
             $this->cacheAdapter->save(self::generateCacheKey($computedOutput), $objectUrl, self::CACHE_TTL);
 
+            return $objectUrl;
         } catch (S3Exception $s3Exception) {
             return false;
         }
-
-        return false;
     }
 
     /**
@@ -134,6 +162,8 @@ class AmazonS3Deployer implements Deployer
         $this->awsSecretKey = $this->configurator->getConfig('amazons3_deployer', 'aws_secret_key');
         $this->bucket = $this->configurator->getConfig('amazons3_deployer', 'bucket');
         $this->bucketRegion = $this->configurator->getConfig('amazons3_deployer', 'bucket_region');
+        $this->autodetectMime = $this->configurator->getConfig('amazons3_deployer', 'autodetect_mime');
+        $this->trigger = $this->configurator->getConfig('amazons3_deployer', 'changes_trigger');
 
         if (empty($this->awsAccessKey) || empty($this->awsSecretKey) || empty($this->bucket) || empty($this->bucketRegion)) {
             return false;
@@ -157,11 +187,23 @@ class AmazonS3Deployer implements Deployer
      * @param Asset $asset
      * @return string Generated basename of asset
      */
-    private static function computeOutputBasename(Asset $asset)
+    private function computeOutputBasename(Asset $asset)
     {
         $ext = $asset->getExtension() ? '.' . $asset->getExtension() : '';
 
-        return $asset->getFilename() . '_' . $asset->getModifiedTimestamp() . $ext;
+        switch ($this->trigger) {
+            case 'md5':
+                $suffix = $asset->getMd5();
+                break;
+            case 'sha1':
+                $suffix = $asset->getSha1();
+                break;
+            case 'filemtime':
+            default:
+                $suffix = $asset->getModifiedTimestamp();
+        }
+
+        return $asset->getFilename() . '_' . $suffix . $ext;
     }
 
     /**
