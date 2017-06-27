@@ -2,6 +2,7 @@
 
 namespace Phassets\Deployers;
 
+use Phassets\Exceptions\PhassetsInternalException;
 use Phassets\Asset;
 use Phassets\Interfaces\CacheAdapter;
 use Phassets\Interfaces\Configurator;
@@ -11,7 +12,7 @@ use Aws\S3\S3Client;
 
 class AmazonS3Deployer implements Deployer
 {
-    const AWS_S3_URL_SCHEMA = 'http://%s.s3.amazonaws.com/%s';
+    const AWS_S3_URL_SCHEMA = 'https://%s.s3.amazonaws.com/%s';
     const ACL_PUBLIC_READ = 'public-read';
 
     const CACHE_TTL = 3600;
@@ -52,7 +53,7 @@ class AmazonS3Deployer implements Deployer
     private $s3Client;
 
     /**
-     * @var bool Whether to set the ContentType to mime_content_type() returned value, when uploading to AWS
+     * @var bool Whether to set the ContentType parameter when uploading the asset to AWS
      */
     private $autodetectMime;
 
@@ -75,37 +76,44 @@ class AmazonS3Deployer implements Deployer
 
     /**
      * Attempt to retrieve a previously deployed asset; if it does exist,
-     * then return an absolute URL to its deployed version without performing
+     * then update the Asset instance's outputUrl property, without performing
      * any further filters' actions.
      *
      * @param Asset $asset
-     * @return string|bool An absolute URL to asset already-processed version or false
-     *                     if the asset was never deployed using this class.
+     * @return bool Whether the Asset was previously deployed or not;
+     *              If yes, then Asset's outputUrl property will be updated.
      */
-    public function getDeployedFile(Asset $asset)
+    public function isPreviouslyDeployed(Asset $asset)
     {
         $computedOutput = $this->computeOutputBasename($asset);
+        $cacheKey = self::generateCacheKey($computedOutput);
 
-        $cachedUrl = $this->cacheAdapter->get(self::generateCacheKey($computedOutput));
+        $cachedUrl = $this->cacheAdapter->get($cacheKey);
 
         if ($cachedUrl !== false) {
-            return $cachedUrl;
+            $asset->setOutputUrl($cachedUrl);
+
+            return true;
         }
 
         if ($this->s3Client->doesObjectExist($this->bucket, $computedOutput)) {
-            return sprintf(self::AWS_S3_URL_SCHEMA, $this->bucket, $computedOutput);
+            $objectUrl = sprintf(self::AWS_S3_URL_SCHEMA, $this->bucket, $computedOutput);
+            $asset->setOutputUrl($objectUrl);
+            $this->cacheAdapter->save($cacheKey, $objectUrl, self::CACHE_TTL);
+
+
+            return true;
         }
 
         return false;
     }
 
     /**
-     * Given an Asset instance, try to deploy the file using internal
-     * rules of this deployer. Returns false in case of failure.
+     * Given an Asset instance, try to deploy is using internal
+     * rules of this deployer and update Asset's property outputUrl.
      *
-     * @param Asset $asset
-     * @return string|bool An absolute URL to asset already-processed version or false
-     *                     if the asset wasn't deployed.
+     * @param Asset $asset Asset instance whose outputUrl property will be modified
+     * @throws PhassetsInternalException If the deployment process fails
      */
     public function deploy(Asset $asset)
     {
@@ -126,7 +134,7 @@ class AmazonS3Deployer implements Deployer
                     $mime = \GuzzleHttp\Psr7\mimetype_from_extension($asset->getExtension());
                 }
 
-                if($mime === null && function_exists('mime_content_type')) {
+                if ($mime === null && function_exists('mime_content_type')) {
                     $mime = mime_content_type($asset->getFullPath());
                 }
 
@@ -142,19 +150,22 @@ class AmazonS3Deployer implements Deployer
 
             $this->cacheAdapter->save(self::generateCacheKey($computedOutput), $objectUrl, self::CACHE_TTL);
 
-            return $objectUrl;
+            $asset->setOutputUrl($objectUrl);
         } catch (S3Exception $s3Exception) {
-            return false;
+            throw new PhassetsInternalException(
+                'AmazonS3Deployer: S3Exception encountered',
+                $s3Exception->getCode(),
+                $s3Exception
+            );
         }
     }
 
     /**
-     * This must return true/false if the current configuration allows
-     * this deployer to deploy processed assets AND it can return previously
-     * deployed assets as well.
+     * This must throw a PhassetsInternalException if the current configuration
+     * doesn't allow this deployer to deploy processed assets.
      *
-     * @return bool True if at this time Phassets can use this deployer to
-     *              deploy and serve deployed assets, false otherwise.
+     * @throws PhassetsInternalException If at this time Phassets can't use this deployer to
+     *                                   deploy and serve deployed assets
      */
     public function isSupported()
     {
@@ -165,8 +176,20 @@ class AmazonS3Deployer implements Deployer
         $this->autodetectMime = $this->configurator->getConfig('amazons3_deployer', 'autodetect_mime');
         $this->trigger = $this->configurator->getConfig('amazons3_deployer', 'changes_trigger');
 
-        if (empty($this->awsAccessKey) || empty($this->awsSecretKey) || empty($this->bucket) || empty($this->bucketRegion)) {
-            return false;
+        if (empty($this->awsAccessKey)) {
+            throw new PhassetsInternalException('AmazonS3Deployer: No or invalid "aws_access_key" setting.');
+        }
+
+        if (empty($this->awsSecretKey)) {
+            throw new PhassetsInternalException('AmazonS3Deployer: No or invalid "aws_secret_key" setting.');
+        }
+
+        if (empty($this->bucket)) {
+            throw new PhassetsInternalException('AmazonS3Deployer: No or invalid "bucket" setting.');
+        }
+
+        if (empty($this->bucketRegion)) {
+            throw new PhassetsInternalException('AmazonS3Deployer: No or invalid "bucket_region" setting.');
         }
 
         $configArray = self::getConfig($this->awsAccessKey, $this->awsSecretKey, $this->bucketRegion);
@@ -174,10 +197,12 @@ class AmazonS3Deployer implements Deployer
         try {
             $this->s3Client = new S3Client($configArray);
         } catch (S3Exception $s3Exception) {
-            return false;
+            throw new PhassetsInternalException(
+                'AmazonS3Deployer: S3Exception encountered.',
+                $s3Exception->getCode(),
+                $s3Exception
+            );
         }
-
-        return true;
     }
 
     /**
